@@ -1,43 +1,57 @@
+import threading
+import keyboard
 import speech_recognition as sr
-import threading, keyboard
+from deepseek_api import get_deepseek_response
 
 r = sr.Recognizer()
 mic = sr.Microphone()
 stop_listening = False
-current_language = "tr-TR"  # Default to Turkish
+current_language = "tr-TR"  # Default Turkish
 
+# === LIVE SPEECH LISTENING ===
 def listen_loop():
     global stop_listening, current_language
     with mic as source:
-        r.adjust_for_ambient_noise(source)
+        print("Calibrating mic (2 sec)...")
+        r.adjust_for_ambient_noise(source, duration=2)
+        print("Mic ready. Speak freely.\n")
+
         while not stop_listening:
-            print(f"Speak now... (Current language: {'Turkish' if current_language == 'tr-TR' else 'English'})")
-            audio = r.listen(source, phrase_time_limit=5)
+            print(f"🎙 Speak now... (Lang: {'TR' if current_language == 'tr-TR' else 'EN'})")
+            try:
+                audio = r.listen(source, timeout=5, phrase_time_limit=5)
+            except sr.WaitTimeoutError:
+                continue
+
             try:
                 text = r.recognize_google(audio, language=current_language)
-                lang_name = "Turkish" if current_language == "tr-TR" else "English"
-                print(f"You said ({lang_name}): {text}")
+                print(f"You said: {text}")
+                response = get_deepseek_response(text, current_language)
+                print(f"🤖 DeepSeek: {response}\n")
             except sr.UnknownValueError:
-                print("Could not understand")
+                print("Could not understand.")
             except sr.RequestError as e:
-                print("Service error:", e)
+                print("Speech API error:", e)
 
 def toggle_language():
     global current_language
     current_language = "en-US" if current_language == "tr-TR" else "tr-TR"
-    lang_name = "Turkish" if current_language == "tr-TR" else "English"
-    print(f"\nLanguage switched to: {lang_name}")
+    print(f"\nLanguage switched to: {'Turkish' if current_language == 'tr-TR' else 'English'}")
 
-# Start listening thread
-listener = threading.Thread(target=listen_loop)
-listener.start()
+def live_mode():
+    global stop_listening
+    stop_listening = False
+    listener = threading.Thread(target=listen_loop, daemon=True)
+    listener.start()
+    keyboard.add_hotkey('space', toggle_language)
+    print("🎧 Listening... (Space = toggle language, Enter = stop)\nCurrent language: Turkish")
+    try:
+        keyboard.wait("enter")
+    except KeyboardInterrupt:
+        pass
+    stop_listening = True
+    listener.join()
+    print("Stopped listening.")
 
-# Register spacebar to toggle language
-keyboard.add_hotkey('space', toggle_language)
-
-print("Listening... (press Space to toggle language, Enter to stop)")
-print("Current language: Turkish")
-keyboard.wait("enter")
-stop_listening = True
-listener.join()
-print("Stopped listening.")
+if __name__ == "__main__":
+    live_mode()
