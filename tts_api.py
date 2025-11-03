@@ -18,7 +18,7 @@ VOICE_MAP = {
 
 HEADERS_BASE = {
     "xi-api-key": ELEVEN_API_KEY,
-    "Accept": "audio/wav",  # prefer WAV to avoid conversion
+    "Accept": "audio/wav",
     "Content-Type": "application/json",
 }
 
@@ -115,19 +115,58 @@ def _mp3_to_wav_bytes(mp3_bytes: bytes) -> bytes | None:
         return None
 
 
-def speak_text(text: str, language: str = "en-US", voice_id: str | None = None, speed: float = 1.0) -> bool:
+def _apply_speed_change(wav_bytes: bytes, speed: float) -> bytes:
     """
-    Request ElevenLabs TTS and play the result from memory (no temp file).
-    Returns True on successful playback, False otherwise.
+    Apply speed change to WAV bytes using ffmpeg if available.
+    Returns modified WAV bytes, or original if conversion fails.
+    """
+    if not _has_ffmpeg() or speed == 1.0:
+        return wav_bytes
+    
+    try:
+        # Build atempo filters (supports 0.5-2.0 per filter)
+        atempo_filters = []
+        v = float(speed)
+        
+        # Chain multiple atempo filters if needed
+        while v > 2.0:
+            atempo_filters.append("atempo=2.0")
+            v /= 2.0
+        while v < 0.5:
+            atempo_filters.append("atempo=0.5")
+            v *= 2.0
+        atempo_filters.append(f"atempo={v:.3f}")
+        filter_str = ",".join(atempo_filters)
+
+        p = subprocess.Popen(
+            ["ffmpeg", "-i", "pipe:0", "-af", filter_str, "-f", "wav", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        modified_wav, _ = p.communicate(wav_bytes)
+        
+        if p.returncode == 0:
+            return modified_wav
+        else:
+            print("🔊 Speed adjustment failed, using original audio")
+            return wav_bytes
+    except Exception as e:
+        print("🔊 Speed adjustment error:", e)
+        return wav_bytes
+
+
+def get_tts_bytes(text: str, language: str = "en-US", voice_id: str | None = None, speed: float = 1.0) -> bytes | None:
+    """
+    Request ElevenLabs TTS and return WAV bytes (does not play audio).
+    Returns WAV bytes on success, None on failure.
     """
     if not ELEVEN_API_KEY:
         print("🔊 ElevenLabs API key not set (ELEVEN_API_KEY).")
-        return False
+        return None
 
     vid = voice_id or VOICE_MAP.get(language) or VOICE_MAP.get("en-US")
     if not vid:
         print("🔊 ElevenLabs voice ID missing for language:", language)
-        return False
+        return None
 
     url = f"{ELEVEN_API_BASE}/text-to-speech/{vid}"
     payload = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
@@ -136,7 +175,7 @@ def speak_text(text: str, language: str = "en-US", voice_id: str | None = None, 
         resp = _session.post(url, json=payload, timeout=_DEFAULT_TIMEOUT, stream=True)
     except requests.RequestException as e:
         print("🔊 ElevenLabs network/error:", e)
-        return False
+        return None
 
     if resp.status_code >= 400:
         print(f"🔊 ElevenLabs error: {resp.status_code} {resp.reason}")
@@ -144,76 +183,50 @@ def speak_text(text: str, language: str = "en-US", voice_id: str | None = None, 
             print("Response body:", resp.text)
         except Exception:
             pass
-        return False
+        return None
 
     content_type = (resp.headers.get("Content-Type") or "").lower()
-    # accumulate bytes (small)
+    
+    # Accumulate bytes
     try:
         audio_bytes = resp.content
-    except Exception as e:
-        # fallback to streamed accumulation
+    except Exception:
         b = bytearray()
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 b.extend(chunk)
         audio_bytes = bytes(b)
 
-    # Try WAV path first
+    # Convert to WAV if necessary
     if "wav" in content_type or audio_bytes[:4] == b'RIFF':
         wav_bytes = audio_bytes
     else:
-        # try mp3 -> wav conversion in-memory
+        # Try mp3 -> wav conversion in-memory
         converted = _mp3_to_wav_bytes(audio_bytes)
         if converted:
             wav_bytes = converted
         else:
             print("🔊 Received non-wav audio and conversion failed.")
-            return False
+            return None
 
-    # optional speedup: re-encode faster locally (frame rate trick) - simple and fast
-    if speed != 1.0:
-        try:
-            # use ffmpeg for in-memory speed change if available
-            if _has_ffmpeg():
-                factor = float(speed)
-                # ffmpeg at runtime: change tempo without pitch shift using atempo (supports 0.5-2.0 chained)
-                # build atempo filters (supports 0.5->2.0 per filter)
-                # For generality, we will use single atempo if in range, otherwise chain
-                atempo_filters = []
-                v = factor
-                while v > 2.0:
-                    atempo_filters.append("atempo=2.0")
-                    v /= 2.0
-                while v < 0.5:
-                    atempo_filters.append("atempo=0.5")
-                    v *= 2.0
-                atempo_filters.append(f"atempo={v:.3f}")
-                filter_str = ",".join(atempo_filters)
+    # Apply speed change if requested
+    if speed != 2.0:
+        wav_bytes = _apply_speed_change(wav_bytes, speed)
 
-                p = subprocess.Popen(
-                    ["ffmpeg", "-i", "pipe:0", "-af", filter_str, "-f", "wav", "-"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                wav_bytes, _ = p.communicate(wav_bytes)
-                if p.returncode != 0:
-                    # if conversion fails, fallback to original wav_bytes
-                    pass
-            else:
-                # fallback: change frame rate quick trick (will change pitch)
-                import wave, audioop
-                buf = io.BytesIO(wav_bytes)
-                wf = wave.open(buf, 'rb')
-                params = (wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes(), wf.getcomptype(), wf.getcompname())
-                raw = wf.readframes(params[3])
-                wf.close()
-                new_rate = int(params[2] * speed)
-                # repackage to wav bytes with new frame rate via ffmpeg not available -> skip speed
-                # safe fallback: skip speed change if we can't do it properly
-                pass
-        except Exception:
-            pass
+    return wav_bytes
 
-    # play wav_bytes via PyAudio
+
+def speak_text(text: str, language: str = "en-US", voice_id: str | None = None, speed: float = 1.0) -> bool:
+    """
+    Request ElevenLabs TTS and play the result from memory (no temp file).
+    Returns True on successful playback, False otherwise.
+    """
+    wav_bytes = get_tts_bytes(text, language, voice_id, speed)
+    
+    if wav_bytes is None:
+        return False
+    
+    # Play wav_bytes via PyAudio
     ok = _play_wav_bytes(wav_bytes)
     return ok
 
